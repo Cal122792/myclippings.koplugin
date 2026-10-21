@@ -5,6 +5,7 @@
 local Dispatcher = require("dispatcher")
 local DataStorage = require("datastorage")
 local Device = require("device")
+local ConfirmBox = require("ui/widget/confirmbox")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local LuaSettings = require("luasettings")
@@ -23,6 +24,7 @@ local MyClippings = WidgetContainer:extend{
 
 local REGEN_DEBOUNCE_SECONDS = 8
 local LINK_SCHEME = "hsjump"
+local DELETE_SCHEME = "hsdel"
 
 -- findAllText's search_flags (added in KOReader 2026.07, koreader#15543):
 -- passing MATCH_ACROSS_TEXT_NODES (0x0001) does let a search match text
@@ -92,6 +94,19 @@ function MyClippings:init()
                 callback = function()
                     UIManager:close(this.external_link_dialog)
                     MyClippings:jumpToLink(link_url)
+                end,
+            }
+        end)
+
+        -- Per-highlight "remove" link in the generated HTML.
+        self.ui.link:registerScheme(DELETE_SCHEME)
+        self.ui.link:addToExternalLinkDialog("51_myclippings_remove", function(this, link_url)
+            if not link_url:match("^" .. DELETE_SCHEME .. "://") then return nil end
+            return {
+                text = _("Remove from My Clippings"),
+                callback = function()
+                    UIManager:close(this.external_link_dialog)
+                    self:removeFromLink(link_url)
                 end,
             }
         end)
@@ -222,6 +237,11 @@ function MyClippings:loadDB()
     else
         self.db = { books = {}, items = {} }
     end
+    self.db.books = self.db.books or {}
+    self.db.items = self.db.items or {}
+    -- Keys of highlights the user manually removed from My Clippings, so
+    -- rescans don't bring them back (see tombstoneKeys).
+    self.db.hidden = self.db.hidden or {}
 end
 
 function MyClippings:saveDB()
@@ -250,6 +270,10 @@ function MyClippings:saveDB()
             it.source or "koreader",
             it.is_note and "true" or "false"
         ))
+    end
+    f:write("  },\n  hidden = {\n")
+    for key in pairs(self.db.hidden or {}) do
+        f:write(string.format("    [%q] = true,\n", key))
     end
     f:write("  },\n}\n")
     f:close()
@@ -353,6 +377,7 @@ function MyClippings:koreaderEditKey(item)
 end
 
 function MyClippings:addItem(item)
+    if self:isTombstoned(item) then return false end
     if item.source == "koreader" and item.datetime and item.datetime ~= "" then
         self._koreader_id_index = self._koreader_id_index or {}
         if not self._koreader_id_built then
@@ -532,6 +557,254 @@ function MyClippings:scheduleRegen()
     self.regenBound = self.regenBound or function() self:regenerateOutputs() end
     self._regen_scheduled = true
     UIManager:scheduleIn(REGEN_DEBOUNCE_SECONDS, self.regenBound)
+end
+
+-- ===================== Removing highlights from My Clippings =====================
+-- Two ways highlights leave the consolidated file:
+--   1. "Refresh": drop KOReader-sourced highlights whose annotation no longer
+--      exists in the book itself (you deleted it there).
+--   2. Manual removal (per-highlight "remove" link in the HTML, or the menu
+--      browser). The highlight is remembered in db.hidden so rescans of
+--      My Clippings.txt / book sidecars don't re-add it. The book's own
+--      annotations and My Clippings.txt are never touched.
+
+local function shortHash(str)
+    local h = 5381
+    for i = 1, #str do
+        h = (h * 33 + str:byte(i)) % 4294967296
+    end
+    return string.format("%08x", h)
+end
+
+local function snippet(str, n)
+    str = (str or ""):gsub("%s+", " ")
+    if #str <= n then return str end
+    local cut = str:sub(1, n):gsub("[\192-\255][\128-\191]*$", "")
+    return cut .. "…"
+end
+
+function MyClippings:invalidateCaches()
+    self._seen = nil
+    self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
+end
+
+function MyClippings:getShowRemoveLinks()
+    local v = self.settings:readSetting("show_remove_links")
+    if v == nil then return true end
+    return v and true or false
+end
+
+-- Stable id used in the HTML's remove links. Takes the canonical-book map
+-- so writeHTML can compute it for every item without rebuilding the map.
+function MyClippings:itemIdWithCanon(canon, item)
+    local g = canon[item.book_path]
+    local title_key = g and g.key or (item.book_path or "")
+    return shortHash(title_key .. "|" .. (item.text or "") .. "|" .. (item.datetime or ""))
+end
+
+function MyClippings:tombstoneKeys(item)
+    local keys = { "t|" .. self:dedupeKey(item) }
+    if item.source == "koreader" and item.datetime and item.datetime ~= "" then
+        table.insert(keys, "d|" .. self:koreaderEditKey(item))
+    end
+    return keys
+end
+
+function MyClippings:isTombstoned(item)
+    local hidden = self.db.hidden
+    if not hidden or next(hidden) == nil then return false end
+    for _i, k in ipairs(self:tombstoneKeys(item)) do
+        if hidden[k] then return true end
+    end
+    return false
+end
+
+function MyClippings:hideItem(item)
+    self.db.hidden = self.db.hidden or {}
+    for _i, k in ipairs(self:tombstoneKeys(item)) do
+        self.db.hidden[k] = true
+    end
+    for i, it in ipairs(self.db.items) do
+        if it == item then
+            table.remove(self.db.items, i)
+            break
+        end
+    end
+    self:invalidateCaches()
+    self:saveDB()
+end
+
+function MyClippings:confirmHideItem(item, on_done)
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Remove this highlight from My Clippings?\n\n“%1”\n\nThe original in your book (or My Clippings.txt) is not touched."),
+            snippet(item.text, 240)),
+        ok_text = _("Remove"),
+        ok_callback = function()
+            self:hideItem(item)
+            self:regenerateOutputs()
+            if on_done then
+                on_done()
+            else
+                UIManager:show(InfoMessage:new{ text = _("Highlight removed."), timeout = 2 })
+            end
+        end,
+    })
+end
+
+-- Handles a tap on a "remove" link inside the generated HTML.
+function MyClippings:removeFromLink(link_url)
+    local id = link_url:match("^" .. DELETE_SCHEME .. "://(%x+)")
+    if not id then return end
+    local canon = self:buildCanonicalBooks()
+    local target
+    for _i, it in ipairs(self.db.items) do
+        if self:itemIdWithCanon(canon, it) == id then
+            target = it
+            break
+        end
+    end
+    if not target then
+        UIManager:show(InfoMessage:new{
+            text = _("That highlight is no longer in the database. This page may be out of date; reopen My Clippings."),
+        })
+        return
+    end
+    -- The page being read is now stale; it's deliberately NOT reloaded from
+    -- here (reloading the reader from inside a link callback is risky).
+    self:confirmHideItem(target, function()
+        UIManager:show(InfoMessage:new{
+            text = _("Highlight removed. Close and reopen My Clippings to see the change."),
+            timeout = 3,
+        })
+    end)
+end
+
+-- Returns a set { [datetime] = true } of the annotations that currently
+-- exist in the book, or nil if that can't be determined reliably (book file
+-- missing, no sidecar, unreadable). nil means "leave this book alone".
+function MyClippings:getLiveAnnotationDatetimes(book_path)
+    local set = {}
+    if self.ui and self.ui.document and self.ui.document.file == book_path
+        and self.ui.annotation and type(self.ui.annotation.annotations) == "table" then
+        for _i, ann in ipairs(self.ui.annotation.annotations) do
+            if ann.datetime then set[ann.datetime] = true end
+        end
+        return set
+    end
+    if lfs.attributes(book_path, "mode") ~= "file" then return nil end
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not ok_ds then return nil end
+    local ok_has, has = pcall(function() return DocSettings:hasSidecarFile(book_path) end)
+    if not ok_has or not has then return nil end
+    local ok_open, settings = pcall(function() return DocSettings:open(book_path) end)
+    if not ok_open or not settings then return nil end
+    local anns = settings:readSetting("annotations")
+    if type(anns) ~= "table" then return nil end
+    for _i, ann in ipairs(anns) do
+        if ann.datetime then set[ann.datetime] = true end
+    end
+    return set
+end
+
+-- KOReader-sourced items whose annotation is gone from the book.
+function MyClippings:findDeletedHighlights()
+    local live_cache = {}
+    local gone, books = {}, {}
+    for _i, it in ipairs(self.db.items) do
+        if it.source == "koreader" and it.datetime and it.datetime ~= ""
+            and it.book_path and not it.book_path:match("^clippings://") then
+            local live = live_cache[it.book_path]
+            if live == nil then
+                live = self:getLiveAnnotationDatetimes(it.book_path) or false
+                live_cache[it.book_path] = live
+            end
+            if live and not live[it.datetime] then
+                table.insert(gone, it)
+                books[it.book_path] = true
+            end
+        end
+    end
+    local n_books = 0
+    for _p in pairs(books) do n_books = n_books + 1 end
+    return gone, n_books
+end
+
+function MyClippings:refreshDeletedHighlights()
+    local gone, n_books = self:findDeletedHighlights()
+    if #gone == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("Nothing to remove: every KOReader highlight in My Clippings still exists in its book."),
+            timeout = 3,
+        })
+        return
+    end
+    local preview = {}
+    for i = 1, math.min(#gone, 5) do
+        table.insert(preview, "• " .. snippet(gone[i].text, 70))
+    end
+    if #gone > 5 then
+        table.insert(preview, T(_("…and %1 more"), #gone - 5))
+    end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("%1 highlight(s) in %2 book(s) no longer exist in the books themselves:\n\n%3\n\nRemove them from My Clippings?"),
+            #gone, n_books, table.concat(preview, "\n")),
+        ok_text = _("Remove"),
+        ok_callback = function()
+            local drop = {}
+            for _i, it in ipairs(gone) do drop[it] = true end
+            local kept = {}
+            for _i, it in ipairs(self.db.items) do
+                if not drop[it] then table.insert(kept, it) end
+            end
+            self.db.items = kept
+            self:invalidateCaches()
+            self:saveDB()
+            self:regenerateOutputs()
+            UIManager:show(InfoMessage:new{
+                text = T(_("Removed %1 highlight(s)."), #gone),
+                timeout = 3,
+            })
+        end,
+    })
+end
+
+-- Menu browser: books -> highlights; tap a highlight to remove it.
+function MyClippings:buildRemoveMenuItems()
+    local canon = self:buildCanonicalBooks()
+    local order, by_book, titles = {}, {}, {}
+    for _i, it in ipairs(self.db.items) do
+        local g = canon[it.book_path] or { key = it.book_path or "?", title = it.book_path }
+        if not by_book[g.key] then
+            by_book[g.key] = {}
+            titles[g.key] = g.title or g.key
+            table.insert(order, g.key)
+        end
+        table.insert(by_book[g.key], it)
+    end
+    table.sort(order, function(a, b) return (titles[a] or ""):lower() < (titles[b] or ""):lower() end)
+    local menu = {}
+    for _i, key in ipairs(order) do
+        local list = by_book[key]
+        table.insert(menu, {
+            text = T("%1 (%2)", titles[key], #list),
+            sub_item_table_func = function()
+                local rows = {}
+                for _j, it in ipairs(list) do
+                    table.insert(rows, {
+                        text = snippet(it.text, 70),
+                        callback = function() self:confirmHideItem(it) end,
+                    })
+                end
+                return rows
+            end,
+        })
+    end
+    if #menu == 0 then
+        menu = { { text = _("No highlights."), select_enabled = false } }
+    end
+    return menu
 end
 
 -- ===================== One-time scan & merge =====================
@@ -1696,6 +1969,12 @@ function MyClippings:writeHTML(out_path)
     local by_book = {}
     local order = {}
     local group_book = {}
+    local show_remove = self:getShowRemoveLinks()
+    local function removeLink(it)
+        if not show_remove then return "" end
+        return ' &middot; <a class="del" href="' .. DELETE_SCHEME .. '://' ..
+            self:itemIdWithCanon(canon, it) .. '">remove</a>'
+    end
     for _, it in ipairs(self.db.items) do
         local g = canon[it.book_path] or { key = it.book_path or "?", title = it.book_path, author = "" }
         if not by_book[g.key] then
@@ -1721,6 +2000,7 @@ function MyClippings:writeHTML(out_path)
     put('.standalone-note{border-style:dashed;background:#faf7f0;}')
     put('.meta{font-size:0.75em;color:#999;margin-top:0.4em;font-style:normal;}')
     put('.meta a{color:#7a5c3e;text-decoration:underline;}')
+    put('.meta a.del{color:#a33;}')
     put('.chapter{font-size:0.78em;color:#a08060;}')
     put('nav{margin-bottom:2em;}nav a{display:block;margin:0.2em 0;color:#5a3e2b;text-decoration:none;}')
     put('</style></head><body><h1>My Clippings</h1>')
@@ -1747,7 +2027,7 @@ function MyClippings:writeHTML(out_path)
             if link then
                 put(' &middot; <a href="' .. link .. '">p.' .. htmlEscape(tostring(it.page or "")) .. '</a>')
             end
-            put('</div></blockquote>')
+            put(removeLink(it) .. '</div></blockquote>')
         end
     else
         put('<nav>')
@@ -1779,7 +2059,7 @@ function MyClippings:writeHTML(out_path)
                 if link then
                     put(' &middot; <a href="' .. link .. '">p.' .. htmlEscape(tostring(it.page or "")) .. '</a>')
                 end
-                    put('</div></blockquote>')
+                put(removeLink(it) .. '</div></blockquote>')
             end
         end
     end
@@ -1901,6 +2181,45 @@ function MyClippings:addToMainMenu(menu_items)
                                 callback = function() self:repairBrokenAnnotationsInCurrentBook() end,
                             },
                         },
+                    },
+                },
+            },
+            {
+                text = _("Remove highlights from My Clippings"),
+                sub_item_table = {
+                    {
+                        text = _("Refresh: remove highlights deleted from their books"),
+                        keep_menu_open = true,
+                        callback = function() self:refreshDeletedHighlights() end,
+                    },
+                    {
+                        text = _("Choose highlights to remove..."),
+                        sub_item_table_func = function() return self:buildRemoveMenuItems() end,
+                    },
+                    {
+                        text = _("Show \"remove\" links in My Clippings file"),
+                        checked_func = function() return self:getShowRemoveLinks() end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self.settings:saveSetting("show_remove_links", not self:getShowRemoveLinks())
+                            self.settings:flush()
+                            self:regenerateOutputs()
+                        end,
+                    },
+                    {
+                        text = _("Restore all removed highlights"),
+                        keep_menu_open = true,
+                        callback = function()
+                            UIManager:show(ConfirmBox:new{
+                                text = _("Bring back every highlight you removed from My Clippings, and rescan?"),
+                                ok_text = _("Restore"),
+                                ok_callback = function()
+                                    self.db.hidden = {}
+                                    self:saveDB()
+                                    self:scanAndMerge()
+                                end,
+                            })
+                        end,
                     },
                 },
             },
